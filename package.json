@@ -39,7 +39,8 @@
     "format:check": "prettier --check \"src/**/*.{ts,js,json}\"",
     "test": "jest",
     "test:coverage": "jest --coverage",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "prepublishOnly": "npm run clean && npm run build"
   },
   "dependencies": {
     "@trustwallet/wallet-core": "^4.6.15",
