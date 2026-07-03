@@ -35,18 +35,27 @@ if (process.env.NODE_ENV !== 'test') {
 // Configuration for RPC endpoints
 const RPC_ENDPOINTS = {
   [NetworkValues.MAINNET]: [
-    'bootstrap1.pactus.org/jsonrpc',
-    'bootstrap2.pactus.org/jsonrpc',
-    'bootstrap3.pactus.org/jsonrpc',
-    'bootstrap4.pactus.org/jsonrpc',
+    'bootstrap1.pactus.org',
+    'bootstrap2.pactus.org',
+    'bootstrap3.pactus.org',
+    'bootstrap4.pactus.org',
   ],
   [NetworkValues.TESTNET]: [
-    'testnet1.pactus.org/jsonrpc',
-    'testnet2.pactus.org/jsonrpc',
-    'testnet3.pactus.org/jsonrpc',
-    'testnet4.pactus.org/jsonrpc',
+    'testnet1.pactus.org',
+    'testnet2.pactus.org',
+    'testnet3.pactus.org',
+    'testnet4.pactus.org',
   ],
 };
+
+const RPC_PORT = 443;
+const RPC_PATH = '/jsonrpc';
+
+// @open-rpc/client-js wraps transport-level failures (unreachable node,
+// timeout, malformed response) in a JSONRPCError with one of these codes
+// (7777 = ERR_TIMEOUT, 7979 = ERR_UNKNOWN); errors answered by a node carry
+// the JSON-RPC error code from the response instead.
+const TRANSPORT_ERROR_CODES: number[] = [7777, 7979];
 
 // Wallet configuration constants
 const WALLET_CONFIG = {
@@ -523,10 +532,8 @@ export class Wallet {
    * @returns Promise with the account balance as Amount
    */
   private async fetchAccount(address: string): Promise<Amount> {
-    const client = this.getClient();
-
     try {
-      const result = await client.pactusBlockchainGetAccount(address);
+      const result = await this.withFailover(client => client.pactusBlockchainGetAccount(address));
 
       if (!result?.account?.balance) {
         return Amount.zero();
@@ -656,7 +663,6 @@ export class Wallet {
   private async getRawTransferTransaction(
     tx: TransferTransaction
   ): Promise<RawTransferTransaction> {
-    const client = this.getClient();
     const txParams = {
       sender: tx.sender,
       receiver: tx.receiver,
@@ -666,13 +672,15 @@ export class Wallet {
     };
 
     try {
-      const result = await client.pactusTransactionGetRawTransferTransaction(
-        undefined,
-        txParams.sender,
-        txParams.receiver,
-        txParams.amount,
-        txParams.fee,
-        txParams.memo
+      const result = await this.withFailover(client =>
+        client.pactusTransactionGetRawTransferTransaction(
+          undefined,
+          txParams.sender,
+          txParams.receiver,
+          txParams.amount,
+          txParams.fee,
+          txParams.memo
+        )
       );
 
       return {
@@ -689,14 +697,14 @@ export class Wallet {
    * Get public key of validator
    */
   async getIndexedPublicKey(address: string): Promise<string> {
-    const client = this.getClient();
-
     try {
       const txParams = {
         address,
       };
 
-      const result = await client.pactusBlockchainGetPublicKey(txParams.address);
+      const result = await this.withFailover(client =>
+        client.pactusBlockchainGetPublicKey(txParams.address)
+      );
 
       return result.public_key ?? '';
     } catch {
@@ -708,8 +716,6 @@ export class Wallet {
    * Get raw bond transaction hex
    */
   private async getRawBondTransaction(tx: BondTransaction): Promise<RawTransferTransaction> {
-    const client = this.getClient();
-
     const txParams = {
       sender: tx.sender,
       receiver: tx.receiver,
@@ -721,14 +727,16 @@ export class Wallet {
     };
 
     try {
-      const result = await client.pactusTransactionGetRawBondTransaction(
-        undefined,
-        txParams.sender,
-        txParams.receiver,
-        txParams.stake,
-        txParams.public_key,
-        txParams.fee,
-        txParams.memo
+      const result = await this.withFailover(client =>
+        client.pactusTransactionGetRawBondTransaction(
+          undefined,
+          txParams.sender,
+          txParams.receiver,
+          txParams.stake,
+          txParams.public_key,
+          txParams.fee,
+          txParams.memo
+        )
       );
 
       return {
@@ -792,7 +800,10 @@ export class Wallet {
    * Broadcast the signed transaction to the network
    */
   async broadcastTransaction(signedRawTxHex: string): Promise<string> {
-    const client = this.getClient();
+    // Broadcast is not retried on transport failures: the transaction may
+    // already have reached the node, and re-broadcasting it surfaces
+    // confusing duplicate-transaction errors.
+    const client = this.getClient(this.shuffledEndpoints()[0]);
     const params = {
       // eslint-disable-next-line @typescript-eslint/naming-convention
       signed_raw_transaction: signedRawTxHex,
@@ -810,7 +821,6 @@ export class Wallet {
   }
 
   async getTransaction(txHash: string): Promise<string> {
-    const client = this.getClient();
     const params = {
       // eslint-disable-next-line @typescript-eslint/naming-convention
       tx_hash: txHash,
@@ -818,7 +828,9 @@ export class Wallet {
     };
 
     try {
-      const result = await client.pactusTransactionGetTransaction(params.tx_hash, params.verbosity);
+      const result = await this.withFailover(client =>
+        client.pactusTransactionGetTransaction(params.tx_hash, params.verbosity)
+      );
 
       return result.id ?? '';
     } catch (error) {
@@ -827,27 +839,74 @@ export class Wallet {
   }
 
   /**
-   * Get a random RPC client endpoint based on network type
+   * Get the RPC endpoints for the wallet network in random order
    * @private
    */
-  private getRandomClient(): string {
+  private shuffledEndpoints(): string[] {
     const endpoints = RPC_ENDPOINTS[this.info.network];
 
     if (!endpoints || endpoints.length === 0) {
       throw new NetworkError('No RPC endpoints available for the current network');
     }
 
-    return endpoints[Math.floor(Math.random() * endpoints.length)];
+    const shuffled = [...endpoints];
+
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+
+    return shuffled;
   }
 
-  private getClient(): InstanceType<typeof PactusOpenRPC> {
+  private getClient(host: string): InstanceType<typeof PactusOpenRPC> {
     return new PactusOpenRPC({
       transport: {
         type: 'https',
-        host: this.getRandomClient(),
-        port: 80,
+        host,
+        port: RPC_PORT,
+        path: RPC_PATH,
       },
     });
+  }
+
+  /**
+   * Run an RPC call, failing over to other endpoints when a node is
+   * unreachable. Errors answered by a node are thrown without retrying.
+   * @private
+   */
+  private async withFailover<T>(
+    call: (client: InstanceType<typeof PactusOpenRPC>) => T
+  ): Promise<Awaited<T>> {
+    const endpoints = this.shuffledEndpoints();
+    const attempts = Math.min(WALLET_CONFIG.MAX_RPC_ATTEMPTS, endpoints.length);
+    let lastError: unknown;
+
+    for (let i = 0; i < attempts; i++) {
+      try {
+        return await call(this.getClient(endpoints[i]));
+      } catch (error) {
+        if (!this.isTransportError(error)) {
+          throw error;
+        }
+
+        lastError = error;
+      }
+    }
+
+    throw lastError;
+  }
+
+  /**
+   * Whether an error is a transport-level failure (safe to retry on another
+   * endpoint) rather than a JSON-RPC error answered by a node
+   * @private
+   */
+  private isTransportError(error: unknown): boolean {
+    const code = (error as { code?: unknown } | null)?.code;
+
+    return typeof code !== 'number' || TRANSPORT_ERROR_CODES.includes(code);
   }
 
   /**

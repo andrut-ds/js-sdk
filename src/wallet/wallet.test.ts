@@ -734,3 +734,71 @@ describe('Validator Public Key', () => {
     expect(publicKey).toBe('public1test123abc');
   });
 });
+
+describe('RPC Failover', () => {
+  let core: WalletCore;
+  let storage: IStorage;
+  const password = '';
+
+  beforeEach(async () => {
+    core = await initWasm();
+    storage = new MemoryStorage();
+  });
+
+  it('should fail over to another endpoint on transport errors', async () => {
+    // ARRANGE
+    const wallet = await Wallet.create(
+      core,
+      storage,
+      password,
+      MnemonicValues.NORMAL,
+      NetworkValues.TESTNET
+    );
+
+    // Simulate an unreachable node (transport error, ERR_UNKNOWN = 7979)
+    const failingClient = {
+      pactusBlockchainGetAccount: jest
+        .fn()
+        .mockRejectedValue(Object.assign(new Error('connection aborted'), { code: 7979 })),
+    };
+    const workingClient = {
+      pactusBlockchainGetAccount: jest.fn().mockResolvedValue({
+        account: { balance: 5000000000 },
+      }),
+    };
+    const getClientSpy = jest
+      .spyOn(wallet as any, 'getClient')
+      .mockReturnValueOnce(failingClient)
+      .mockReturnValueOnce(workingClient);
+
+    // ACT
+    const balance = await wallet.getAddressBalance('tpc1test123');
+
+    // ASSERT
+    expect(balance.toString()).toBe('5000000000');
+    expect(getClientSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('should not retry errors answered by a node', async () => {
+    // ARRANGE
+    const wallet = await Wallet.create(
+      core,
+      storage,
+      password,
+      MnemonicValues.NORMAL,
+      NetworkValues.TESTNET
+    );
+
+    // Simulate a JSON-RPC error response from the node
+    const nodeErrorClient = {
+      pactusBlockchainGetAccount: jest
+        .fn()
+        .mockRejectedValue(Object.assign(new Error('invalid address'), { code: -32602 })),
+    };
+    const getClientSpy = jest.spyOn(wallet as any, 'getClient').mockReturnValue(nodeErrorClient);
+
+    // ACT + ASSERT
+    await expect(wallet.getAddressBalance('invalid')).rejects.toThrow('invalid address');
+    expect(getClientSpy).toHaveBeenCalledTimes(1);
+  });
+});
